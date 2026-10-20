@@ -173,14 +173,14 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 .as_ref()
                 .map(|i| {
                     format!(
-                        "{} {} ({})",
+                        "（COM 自报名 {} {} / {}）",
                         i.name,
                         i.version.clone().unwrap_or_default(),
                         i.prog_id
                     )
                 })
                 .unwrap_or_default();
-            println!("已连接 {who}（{mode:?}）");
+            println!("已连接 {}（{mode:?}）{who}", engine_label(engine));
         }
         "switch" => {
             let mut it = args.split_whitespace();
@@ -561,12 +561,23 @@ fn pick_doc(docs: &[DocumentInfo], sel: &str) -> Result<(String, String)> {
 }
 
 fn print_status(s: &WordStatus) {
-    let id = s.identity.as_ref();
+    // 引擎名用我方选择结果：WPS 会自报 Name="Microsoft Word"，不能拿它当引擎名。
+    let engine = s.engine.map(engine_label).unwrap_or("-");
+    let self_report = s
+        .identity
+        .as_ref()
+        .map(|i| {
+            format!(
+                "（COM 自报名: {:?} 版本: {} ProgID: {}）",
+                i.name,
+                i.version.clone().unwrap_or_default(),
+                i.prog_id
+            )
+        })
+        .unwrap_or_default();
     println!(
-        "引擎: {}  已连接: {}  拥有实例: {}",
-        id.map(|i| i.name.clone()).unwrap_or_default(),
-        s.connected,
-        s.owns_instance
+        "引擎: {} {}  已连接: {}  拥有实例: {}",
+        engine, self_report, s.connected, s.owns_instance
     );
     println!(
         "活动文档: {}",

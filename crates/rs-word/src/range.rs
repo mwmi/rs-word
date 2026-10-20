@@ -89,7 +89,7 @@ impl Range {
     pub fn collapse_end(&self) -> Result<Range> {
         let dup = self
             .raw
-            .call("Duplicate", vec![])?
+            .get("Duplicate")?
             .idispatch_child("Duplicate")?;
         dup.call("Collapse", vec![ComValue::Int(0)])?;
         Ok(Range::new(dup))
@@ -99,7 +99,7 @@ impl Range {
     pub fn collapse_start(&self) -> Result<Range> {
         let dup = self
             .raw
-            .call("Duplicate", vec![])?
+            .get("Duplicate")?
             .idispatch_child("Duplicate")?;
         dup.call("Collapse", vec![ComValue::Int(1)])?;
         Ok(Range::new(dup))

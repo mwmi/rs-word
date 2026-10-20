@@ -154,6 +154,7 @@ impl Session {
         let adapter = adapter_for(engine);
         let connected = engine::connect(adapter.as_ref(), mode)?;
         let app = App::new(connected.root, engine);
+        show_new_instance(&app, connected.owned);
         let caps = capabilities::probe(&app);
         let mut s = Self {
             engine,
@@ -216,6 +217,7 @@ impl Session {
         self.prog_id = connected.prog_id;
         self.app = App::new(connected.root, engine);
         self.owned = connected.owned;
+        show_new_instance(&self.app, self.owned);
         self.identity = Some(connected.identity);
         self.caps = capabilities::probe(&self.app);
         self.docs.clear();
@@ -669,6 +671,13 @@ impl Session {
         let removed = crate::vba::cleanup_stale(&d, &mut owned);
         self.owned_modules = owned;
         removed
+    }
+}
+
+/// 新建（`owned`）的实例 COM 默认不可见，显式显示，避免用户看不到写入内容。
+fn show_new_instance(app: &App, owned: bool) {
+    if owned {
+        let _ = app.set_visible(true);
     }
 }
 

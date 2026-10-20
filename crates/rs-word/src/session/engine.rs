@@ -148,6 +148,38 @@ fn probe_of(root: &IDispatchWrapper, adapter: &dyn WordEngineAdapter) -> Probe {
     }
 }
 
+/// 上溯到 Application：ROT 里注册的可能是 Document 等子对象（真机实测 Word 就是
+/// 只把 Document 注册进 ROT，Application 反而不在），此时 `Path/Name` 落在文档上，
+/// 必须读它的 `Application` 才能核验引擎归属。
+fn as_application(root: IDispatchWrapper) -> IDispatchWrapper {
+    if root.has_member("Documents") {
+        return root;
+    }
+    if root.has_member("Application") {
+        if let Ok(app) = root.get_obj("Application", "Application") {
+            if app.has_member("Documents") {
+                return app;
+            }
+        }
+    }
+    root
+}
+
+/// 实例的文档数。0 表示空壳实例（真机实测 WPS 的 `…/Automation -Embedding`
+/// 后台进程就注册在 ROT 里且没有任何文档）。
+fn document_count(app: &IDispatchWrapper) -> i32 {
+    app.get_obj("Documents", "Documents")
+        .and_then(|d| d.get("Count"))
+        .and_then(|c| c.int())
+        .unwrap_or(0)
+}
+
+/// 归属核验通过时返回 **Application** 包装（可能由 Document 上溯而来）。
+fn matched_application(disp: IDispatch, adapter: &dyn WordEngineAdapter) -> Option<IDispatchWrapper> {
+    let app = as_application(IDispatchWrapper::root(disp, adapter.engine().label()));
+    matches!(probe_of(&app, adapter), Probe::Match).then_some(app)
+}
+
 /// 读取身份信息并核验归属（不能只信 ProgID）。
 pub fn verify_identity(
     adapter: &dyn WordEngineAdapter,
@@ -189,28 +221,36 @@ pub fn verify_identity(
     })
 }
 
-/// 统一连接：`Attach` 接管已运行实例，`New` 新建实例。
+/// 统一连接入口：按引擎分派到各自的连接写法。
+///
+/// - **WPS Writer**：接管已运行实例（`GetActiveObject` → ROT 枚举），按 `Application.Path`
+///   核验归属；`mode=New` 时才新建，绝不主动启动 WPS。
+/// - **Microsoft Word**：同样只接管已运行实例（找不到即报错，不新建）；`mode=New` 才新建。
 pub fn connect(adapter: &dyn WordEngineAdapter, mode: ConnectMode) -> Result<Connected> {
-    let engine = adapter.engine();
+    match adapter.engine() {
+        WordEngine::WpsWriter => connect_wps(adapter, mode),
+        WordEngine::MsWord => connect_word(adapter, mode),
+    }
+}
+
+/// WPS 写法：逐候选 ProgID 接管已运行实例（不猜测、不主动新建）。
+fn connect_wps(adapter: &dyn WordEngineAdapter, mode: ConnectMode) -> Result<Connected> {
     // 逐候选记录失败原因（不再只留最后一条，避免被低优先级候选掩盖真实原因）。
     let mut errors: Vec<String> = Vec::new();
-    for prog_id in adapter.prog_id_candidates() {
-        let prog = HSTRING::from(*prog_id);
-        let clsid = match unsafe { CLSIDFromProgID(PCWSTR::from_raw(prog.as_ptr())) } {
+    for &prog_id in adapter.prog_id_candidates() {
+        let clsid = match clsid_of(prog_id) {
             Ok(c) => c,
-            Err(e) => {
-                errors.push(format!("{prog_id}：ProgID 未注册（{}）", hr_of(&e)));
+            Err(msg) => {
+                errors.push(msg);
                 continue;
             }
         };
         let disp = match mode {
-            ConnectMode::New => unsafe {
-                match CoCreateInstance::<_, IDispatch>(&clsid, None, CLSCTX_LOCAL_SERVER) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        errors.push(format!("{prog_id}：新建实例失败（{}）", hr_of(&e)));
-                        continue;
-                    }
+            ConnectMode::New => match create_instance(&clsid, prog_id) {
+                Ok(d) => d,
+                Err(msg) => {
+                    errors.push(msg);
+                    continue;
                 }
             },
             ConnectMode::Attach => match attach_engine(&clsid, adapter) {
@@ -221,32 +261,98 @@ pub fn connect(adapter: &dyn WordEngineAdapter, mode: ConnectMode) -> Result<Con
                 }
             },
         };
-        let root = IDispatchWrapper::root(disp, engine.label());
-        let identity = match verify_identity(adapter, &root, prog_id) {
-            Ok(id) => id,
-            Err(e) => {
-                errors.push(format!("{prog_id}：身份核验失败（{e}）"));
+        match finish(adapter, disp, prog_id, matches!(mode, ConnectMode::New)) {
+            Ok(c) => return Ok(c),
+            Err(msg) => {
+                errors.push(format!("{prog_id}：身份核验失败（{msg}）"));
                 continue;
             }
-        };
-        return Ok(Connected {
-            root,
-            identity,
-            prog_id: (*prog_id).to_string(),
-            owned: matches!(mode, ConnectMode::New),
-        });
+        }
     }
+    Err(connect_failed(adapter, mode, errors))
+}
+
+/// MS Word 写法：`Attach` 只接管已运行实例（与 WPS 一致，找不到就报错，绝不新建）；
+/// 只有显式 `mode=New` 才新建实例。
+fn connect_word(adapter: &dyn WordEngineAdapter, mode: ConnectMode) -> Result<Connected> {
+    let prog_id = *adapter
+        .prog_id_candidates()
+        .first()
+        .expect("Microsoft Word 至少有一个 ProgID 候选");
+    let mut errors: Vec<String> = Vec::new();
+    let clsid = match clsid_of(prog_id) {
+        Ok(c) => c,
+        Err(msg) => return Err(connect_failed(adapter, mode, vec![msg])),
+    };
+    let (disp, owned) = match mode {
+        ConnectMode::New => match create_instance(&clsid, prog_id) {
+            Ok(d) => (d, true),
+            Err(msg) => return Err(connect_failed(adapter, mode, vec![msg])),
+        },
+        ConnectMode::Attach => match attach_engine(&clsid, adapter) {
+            Ok(d) => (d, false),
+            Err(e) => {
+                errors.push(format!("{prog_id}：接管失败（{e}）"));
+                return Err(connect_failed(adapter, mode, errors));
+            }
+        },
+    };
+    match finish(adapter, disp, prog_id, owned) {
+        Ok(c) => Ok(c),
+        Err(msg) => {
+            errors.push(format!("{prog_id}：身份核验失败（{msg}）"));
+            Err(connect_failed(adapter, mode, errors))
+        }
+    }
+}
+
+/// 连接收尾：包装 root 并核验身份（不能只信 ProgID）。
+fn finish(
+    adapter: &dyn WordEngineAdapter,
+    disp: IDispatch,
+    prog_id: &str,
+    owned: bool,
+) -> std::result::Result<Connected, String> {
+    let root = IDispatchWrapper::root(disp, adapter.engine().label());
+    let identity = verify_identity(adapter, &root, prog_id).map_err(|e| e.to_string())?;
+    Ok(Connected {
+        root,
+        identity,
+        prog_id: prog_id.to_string(),
+        owned,
+    })
+}
+
+/// ProgID → CLSID（未注册返回可读错误）。
+fn clsid_of(prog_id: &str) -> std::result::Result<GUID, String> {
+    let prog = HSTRING::from(prog_id);
+    unsafe { CLSIDFromProgID(PCWSTR::from_raw(prog.as_ptr())) }
+        .map_err(|e| format!("{prog_id}：ProgID 未注册（{}）", hr_of(&e)))
+}
+
+/// 新建实例（`CoCreateInstance`，本地服务器）。
+fn create_instance(clsid: &GUID, prog_id: &str) -> std::result::Result<IDispatch, String> {
+    unsafe { CoCreateInstance::<_, IDispatch>(clsid, None, CLSCTX_LOCAL_SERVER) }
+        .map_err(|e| format!("{prog_id}：新建实例失败（{}）", hr_of(&e)))
+}
+
+/// 连接失败的统一错误（含逐候选原因与按模式的提示）。
+fn connect_failed(
+    adapter: &dyn WordEngineAdapter,
+    mode: ConnectMode,
+    errors: Vec<String>,
+) -> anyhow::Error {
     let mode_hint = if matches!(mode, ConnectMode::Attach) {
         "Attach 需目标应用已运行；若未打开请先打开文档，或改用 mode=new（新建实例）"
     } else {
         "确认目标应用已安装且可启动"
     };
-    Err(WordError::new(
+    WordError::new(
         "connect",
-        engine.label(),
+        adapter.engine().label(),
         format!(
             "无法连接 {}（候选 ProgID: {:?}）",
-            engine.label(),
+            adapter.engine().label(),
             adapter.prog_id_candidates()
         ),
     )
@@ -254,7 +360,7 @@ pub fn connect(adapter: &dyn WordEngineAdapter, mode: ConnectMode) -> Result<Con
         "{mode_hint}。逐候选结果：\n  {}",
         errors.join("\n  ")
     ))
-    .into())
+    .into()
 }
 
 /// HRESULT 简要表示（如 `0x800401F3 无效的类字符串`）。
@@ -262,16 +368,42 @@ fn hr_of(e: &windows::core::Error) -> String {
     format!("0x{:08X} {}", e.code().0 as u32, e)
 }
 
-/// Attach：经 ROT 接管已运行的目标引擎实例（按进程可执行名校验，避免误连被接管的实例）。
+/// Attach：接管已运行的目标引擎实例。
+///
+/// 先 `GetActiveObject`（可能被另一引擎接管，需身份核验），再枚举 ROT。
+/// 同一引擎可能注册多个对象（真机实测 WPS 会把无文档的后台 `…/Automation -Embedding`
+/// 进程注册进 ROT；MS Word 只把 Document 注册进 ROT）。因此按下列优先级取实例：
+/// **可见且有文档 > 有文档 > 可见 > 其他**，避免绑到后台空壳或自动化实例。
 fn attach_engine(clsid: &GUID, adapter: &dyn WordEngineAdapter) -> Result<IDispatch> {
+    let mut best: Option<(u8, IDispatch)> = None;
+
+    let mut consider = |app: IDispatchWrapper| -> Option<IDispatch> {
+        let score = match (app_visible(&app), document_count(&app) > 0) {
+            (true, true) => 3,
+            (false, true) => 2,
+            (true, false) => 1,
+            (false, false) => 0,
+        };
+        let better = match &best {
+            Some((s, _)) => score > *s,
+            None => true,
+        };
+        if better {
+            best = Some((score, app.disp));
+        }
+        (score == 3).then(|| best.as_ref().unwrap().1.clone())
+    };
+
     let mut unk: Option<IUnknown> = None;
     unsafe { GetActiveObject(clsid, None, &mut unk).ok() };
     if let Some(disp) = unk.and_then(|u| u.cast::<IDispatch>().ok()) {
-        let root = IDispatchWrapper::root(disp.clone(), adapter.engine().label());
-        if matches!(probe_of(&root, adapter), Probe::Match) {
-            return Ok(disp);
+        if let Some(app) = matched_application(disp, adapter) {
+            if let Some(found) = consider(app) {
+                return Ok(found);
+            }
         }
     }
+
     unsafe {
         let rot = GetRunningObjectTable(0)?;
         let enum_moniker = rot.EnumRunning()?;
@@ -283,11 +415,16 @@ fn attach_engine(clsid: &GUID, adapter: &dyn WordEngineAdapter) -> Result<IDispa
             let Ok(disp) = obj.cast::<IDispatch>() else {
                 continue;
             };
-            let root = IDispatchWrapper::root(disp.clone(), adapter.engine().label());
-            if matches!(probe_of(&root, adapter), Probe::Match) {
-                return Ok(disp);
+            let Some(app) = matched_application(disp, adapter) else {
+                continue;
+            };
+            if let Some(found) = consider(app) {
+                return Ok(found);
             }
         }
+    }
+    if let Some((_, disp)) = best {
+        return Ok(disp);
     }
     Err(WordError::new(
         "connect.attach",
@@ -299,4 +436,11 @@ fn attach_engine(clsid: &GUID, adapter: &dyn WordEngineAdapter) -> Result<IDispa
     )
     .with_hint("确认目标应用已打开文档；如未运行，改用 connect new")
     .into())
+}
+
+/// 实例是否有可见窗口（后台 `-Embedding` 实例通常不可见）。
+fn app_visible(app: &IDispatchWrapper) -> bool {
+    app.get("Visible")
+        .and_then(|v| v.bool())
+        .unwrap_or(false)
 }
