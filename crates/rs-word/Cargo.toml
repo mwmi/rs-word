@@ -1,0 +1,27 @@
+[package]
+name = "rs-word"
+version = "0.1.0"
+edition = "2021"
+description = "Rust + COM 自动化 WPS Writer / Microsoft Word 库（Windows 专用，IDispatch 后期绑定）"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+crossbeam-channel = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Globalization",
+] }
+windows-core = "0.62"

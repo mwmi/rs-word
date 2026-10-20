@@ -1,0 +1,12 @@
+[package]
+name = "rs-word-cli"
+version = "0.1.0"
+edition = "2021"
+description = "rs-word 库的交互式 REPL 测试工具"
+
+[dependencies]
+rs-word = { path = "../rs-word" }
+anyhow = "1"
+reedline = "0.52.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

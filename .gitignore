@@ -1,0 +1,22 @@
+# Rust / Cargo 构建产物
+/target/
+**/*.rs.bk
+*.pdb
+
+# 临时文件
+*.tmp
+/tmp/
+
+# IDE / 助手配置
+/.trae/
+/.vscode/
+/.idea/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 本地环境变量
+.env
+.env.local

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/rs-word", "crates/rs-word-cli"]
+resolver = "2"
