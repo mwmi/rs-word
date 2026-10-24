@@ -13,7 +13,8 @@ use crate::session::{Request, Response};
 use crate::types::{
     AdvancedRequest, AdvancedResult, ClosePolicy, CloseResult, ConnectMode, DocumentInfo,
     EditRequest, EditResult, EnginePolicy, FindRequest, FindResult, FormatRequest, FormatResult,
-    HistoryRequest, HistoryResult, LayoutRequest, LayoutResult, MediaRequest, MediaResult,
+    HistoryAction, HistoryRequest, HistoryResult, LayoutRequest, LayoutResult, MediaRequest,
+    MediaResult,
     ReadRequest, ReadResult, ReplaceApplyRequest, ReplacePreview, ReplacePreviewRequest,
     ReplaceResult, ReviewRequest, ReviewResult, SaveFormat, SaveResult, TableRequest, TableResult,
     VbaExecuteRequest, VbaExecuteResult, VbaResult, VbaRunRequest, VbaStatus, WordEngine,
@@ -110,6 +111,14 @@ impl WordClient {
         )? {
             Response::Document(d) => Ok(d),
             _ => Err(bad_variant("new_document")),
+        }
+    }
+
+    /// 活动窗口句柄（`Application.ActiveWindow.Hwnd`）：供宿主做 Win32 置前（见 doc_focus）
+    pub fn hwnd(&self) -> Result<i32, ToolError> {
+        match self.call(Request::Hwnd, D_QUICK)? {
+            Response::Hwnd(h) => Ok(h),
+            _ => Err(bad_variant("hwnd")),
         }
     }
 
@@ -225,6 +234,22 @@ impl WordClient {
             Response::History(r) => Ok(r),
             _ => Err(bad_variant("history")),
         }
+    }
+
+    /// 原生历史动作（清空 / 自定义撤销记录开始与结束）：与 [`history`](Self::history) 同一通道，
+    /// 只省掉调用方每次拼一份 `HistoryRequest`
+    pub fn history_op(
+        &self,
+        document_id: &str,
+        action: HistoryAction,
+        label: Option<&str>,
+    ) -> Result<HistoryResult, ToolError> {
+        self.history(HistoryRequest {
+            document_id: document_id.to_string(),
+            action,
+            checkpoint_dir: None,
+            label: label.map(str::to_string),
+        })
     }
 
     pub fn vba_status(&self, document_id: &str) -> Result<VbaStatus, ToolError> {

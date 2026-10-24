@@ -1,9 +1,15 @@
 //! Target 解析：tagged enum → 固定 Range（含 story 与边界校验）。
+//!
+//! 表格多选（`Target::TableCells`）会拆成多段：连续矩形一段一个 Range，
+//! 由 [`resolve_ranges`] 交给格式一次批量写完（见 [`crate::format::apply`]）。
+
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 
 use crate::anchors;
 use crate::app::App;
+use crate::com::dispatch::IDispatchWrapper;
 use crate::com::variant::ComValue;
 use crate::document::Document;
 use crate::error::WordError;
@@ -50,6 +56,191 @@ fn resolved(range: Range, story: Story) -> Result<Resolved> {
         start,
         end,
     })
+}
+
+/// 1 基表格序号 → Table 对象。
+fn table_of(doc: &Document, table_id: &str) -> Result<IDispatchWrapper> {
+    let idx = table_index(table_id)?;
+    doc.tables()?
+        .call("Item", vec![ComValue::Int(idx)])?
+        .idispatch_child(table_id)
+}
+
+/// 表格行列数；读不到按 0（= 不做越界校验）。
+fn table_dims(t: &IDispatchWrapper) -> (u32, u32) {
+    let count = |name: &str| -> u32 {
+        t.get_obj(name, name)
+            .and_then(|c| c.get("Count"))
+            .and_then(|v| v.int())
+            .map(|n| n.max(0) as u32)
+            .unwrap_or(0)
+    };
+    (count("Rows"), count("Columns"))
+}
+
+/// 单元格矩形（1 基，两端含）。
+struct CellRect {
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+}
+
+/// `Table.Cell(Row, Column)`：位置参数（WPS 的具名参数支持不全）。
+fn cell_of(t: &IDispatchWrapper, row: u32, column: u32) -> Result<IDispatchWrapper> {
+    t.call(
+        "Cell",
+        vec![ComValue::Int(row as i32), ComValue::Int(column as i32)],
+    )?
+    .idispatch_child("Cell")
+}
+
+fn cell_range(t: &IDispatchWrapper, row: u32, column: u32) -> Result<Range> {
+    cell_of(t, row, column)
+        .and_then(|cell| cell.get_obj("Range", "Cell.Range"))
+        .map(Range::new)
+        .map_err(|e| {
+            WordError::hint(
+                e,
+                format!("第 {row} 行第 {column} 列取不到（合并单元格或表格已变）：先 word_read view=table 看结构"),
+            )
+        })
+}
+
+/// 矩形选区 → 一个连续 Range（左上格起点 … 右下格终点，含单元格结束标记）。
+///
+/// 整表/整行/整列优先走 Table/Rows/Columns 的 Range：合并单元格也算在内，且少一次取格。
+fn rect_range(doc: &Document, t: &IDispatchWrapper, rect: &CellRect) -> Result<Range> {
+    let (rows, cols) = table_dims(t);
+    let full_width = cols > 0 && rect.c1 <= 1 && rect.c2 >= cols;
+    let full_height = rows > 0 && rect.r1 <= 1 && rect.r2 >= rows;
+    if full_width && full_height {
+        if let Ok(range) = t.get_obj("Range", "Table.Range") {
+            return Ok(Range::new(range));
+        }
+    }
+    if full_width && rect.r1 == rect.r2 {
+        if let Ok(range) = t
+            .get_obj("Rows", "Table.Rows")
+            .and_then(|rows| rows.call("Item", vec![ComValue::Int(rect.r1 as i32)]))
+            .and_then(|row| row.idispatch_child("Row"))
+            .and_then(|row| row.get_obj("Range", "Row.Range"))
+        {
+            return Ok(Range::new(range));
+        }
+    }
+    if full_height && rect.c1 == rect.c2 {
+        if let Ok(range) = t
+            .get_obj("Columns", "Table.Columns")
+            .and_then(|columns| columns.call("Item", vec![ComValue::Int(rect.c1 as i32)]))
+            .and_then(|column| column.idispatch_child("Column"))
+            .and_then(|column| column.get_obj("Range", "Column.Range"))
+        {
+            return Ok(Range::new(range));
+        }
+    }
+    let start = cell_range(t, rect.r1, rect.c1)?.start()?;
+    let end = cell_range(t, rect.r2, rect.c2)?.end()?;
+    if end < start {
+        return Err(WordError::new(
+            "target",
+            doc.label(),
+            format!(
+                "单元格范围 {}-{} 行 × {}-{} 列取到的位置反了（{start}>{end}），表格结构可能已变",
+                rect.r1, rect.r2, rect.c1, rect.c2
+            ),
+        )
+        .with_hint("重新 word_read view=tables_summary 再定位")
+        .into());
+    }
+    doc.range(start, end)
+}
+
+/// 一维起止：都对 0 = 取满；只给一端 = 单行/单列；给反了自动换过来。
+fn axis(start: u32, end: u32, count: u32) -> (u32, u32) {
+    let (s, e) = match (start, end) {
+        (0, 0) => (1, count.max(1)),
+        (0, e) => (e, e),
+        (s, 0) => (s, s),
+        (s, e) => (s.min(e), s.max(e)),
+    };
+    (s.max(1), e.max(s).max(1))
+}
+
+fn check_bounds(doc: &Document, r1: u32, r2: u32, c1: u32, c2: u32, rows: u32, cols: u32) -> Result<()> {
+    if r1 > 0 && c1 > 0 && (rows == 0 || r2 <= rows) && (cols == 0 || c2 <= cols) {
+        return Ok(());
+    }
+    Err(WordError::new(
+        "target",
+        doc.label(),
+        format!("单元格范围 {r1}-{r2} 行 × {c1}-{c2} 列越界（表格共 {rows} 行 {cols} 列）"),
+    )
+    .with_hint("行列都从 1 起；尺寸先 word_read view=tables_summary 或 word_table action=inspect")
+    .into())
+}
+
+/// 多选目标展开成若干矩形段：同一行相邻列合成一段，一段只发一次 COM。
+fn cell_rects(doc: &Document, t: &IDispatchWrapper, target: &Target) -> Result<Vec<CellRect>> {
+    let Target::TableCells {
+        row_start,
+        row_end,
+        col_start,
+        col_end,
+        cells,
+        ..
+    } = target
+    else {
+        return Ok(Vec::new());
+    };
+    let (rows, cols) = table_dims(t);
+    let mut rects: Vec<CellRect> = Vec::new();
+    if cells.is_empty() {
+        let (r1, r2) = axis(*row_start, *row_end, rows);
+        let (c1, c2) = axis(*col_start, *col_end, cols);
+        check_bounds(doc, r1, r2, c1, c2, rows, cols)?;
+        rects.push(CellRect { r1, c1, r2, c2 });
+        return Ok(rects);
+    }
+    let mut by_row: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for cell in cells {
+        let (row, column) = cell.rc();
+        if row == 0 || column == 0 {
+            return Err(WordError::new(
+                "target",
+                doc.label(),
+                format!("cells 里有 0：({row},{column})"),
+            )
+            .with_hint("行列都从 1 起，例 cells:[{\"row\":1,\"column\":2}]")
+            .into());
+        }
+        by_row.entry(row).or_default().push(column);
+    }
+    for (row, mut columns) in by_row {
+        columns.sort_unstable();
+        columns.dedup();
+        check_bounds(
+            doc,
+            row,
+            row,
+            columns[0],
+            *columns.last().unwrap_or(&columns[0]),
+            rows,
+            cols,
+        )?;
+        let (mut run_start, mut prev) = (columns[0], columns[0]);
+        for &column in &columns[1..] {
+            if column == prev + 1 {
+                prev = column;
+                continue;
+            }
+            rects.push(CellRect { r1: row, c1: run_start, r2: row, c2: prev });
+            run_start = column;
+            prev = column;
+        }
+        rects.push(CellRect { r1: row, c1: run_start, r2: row, c2: prev });
+    }
+    Ok(rects)
 }
 
 /// 解析 Target 为固定 Range。
@@ -187,6 +378,39 @@ pub fn resolve(app: &App, doc: &Document, target: &Target) -> Result<Resolved> {
             );
             resolved(range, Story::Main)
         }
+        Target::Table {
+            document_id,
+            table_id,
+        } => {
+            ensure_doc(doc, document_id)?;
+            resolved(
+                Range::new(table_of(doc, table_id)?.get_obj("Range", "Table.Range")?),
+                Story::Main,
+            )
+        }
+        // 单 Range 的语义只在连续矩形上成立：零散多选由 resolve_ranges 拆段（格式专用）
+        Target::TableCells {
+            document_id,
+            table_id,
+            ..
+        } => {
+            ensure_doc(doc, document_id)?;
+            let t = table_of(doc, table_id)?;
+            let rects = cell_rects(doc, &t, target)?;
+            if rects.len() != 1 {
+                return Err(WordError::new(
+                    "target",
+                    doc.label(),
+                    format!(
+                        "target=table_cells 是 {} 段不连续选区，只有格式（word_format）能一次写完",
+                        rects.len()
+                    ),
+                )
+                .with_hint("改文字/删内容请给连续矩形，或逐个单元格定位")
+                .into());
+            }
+            resolved(rect_range(doc, &t, &rects[0])?, Story::Main)
+        }
         Target::HeaderFooter {
             document_id,
             section,
@@ -224,4 +448,24 @@ pub fn resolve(app: &App, doc: &Document, target: &Target) -> Result<Resolved> {
             resolved(range, story)
         }
     }
+}
+
+/// 解析成多段 Range：表格多选按连续矩形拆段，其余目标只有一段（= [`resolve`]）。
+pub fn resolve_ranges(app: &App, doc: &Document, target: &Target) -> Result<Vec<Resolved>> {
+    let Target::TableCells {
+        document_id,
+        table_id,
+        ..
+    } = target
+    else {
+        return Ok(vec![resolve(app, doc, target)?]);
+    };
+    ensure_doc(doc, document_id)?;
+    let t = table_of(doc, table_id)?;
+    let rects = cell_rects(doc, &t, target)?;
+    let mut out = Vec::with_capacity(rects.len());
+    for rect in &rects {
+        out.push(resolved(rect_range(doc, &t, rect)?, Story::Main)?);
+    }
+    Ok(out)
 }

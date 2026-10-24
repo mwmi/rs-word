@@ -456,6 +456,7 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 document_id: id,
                 action,
                 checkpoint_dir: None,
+                label: None,
             }))?;
         }
         "vba" => {

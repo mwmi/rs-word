@@ -232,12 +232,14 @@ fn read_table(
     max_items: usize,
 ) -> Result<(String, Vec<Vec<String>>)> {
     let table_id = match target {
-        Target::TableCell { table_id, .. } => table_id.clone(),
+        Target::TableCell { table_id, .. }
+        | Target::Table { table_id, .. }
+        | Target::TableCells { table_id, .. } => table_id.clone(),
         _ => {
             return Err(WordError::new(
                 "read.table",
                 doc.label(),
-                "view=table 需要 target.kind=table_cell 提供 table_id",
+                "view=table 需要 target.kind=table_cell / table_cells / table 提供 table_id",
             )
             .into())
         }

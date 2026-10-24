@@ -63,6 +63,7 @@ pub enum Request {
         dirty_policy: DirtyPolicy,
     },
     Status,
+    Hwnd,
     ListDocuments,
     Open {
         path: String,
@@ -115,6 +116,7 @@ pub enum Request {
 /// worker → 客户端的结果（typed）。
 pub enum Response {
     Status(WordStatus),
+    Hwnd(i32),
     Documents(Vec<DocumentInfo>),
     Document(DocumentInfo),
     Save(SaveResult),
@@ -299,6 +301,14 @@ impl Session {
             revision_count: d.revision_count(),
             is_active: s.key == active_key,
         })
+    }
+
+    /// 活动窗口句柄（`Application.ActiveWindow.Hwnd`）：宿主拿它做 Win32 置前（跨进程
+    /// Activate 常被前台锁定拦下）。`Hwnd` 是 Excel 专有成员，Word / WPS Writer 的
+    /// `Application` 没有（见 engine::exe_probe），句柄在 ActiveWindow 上 —— 跟着活动
+    /// 文档走，先 Activate 目标再取，拿到的才是目标文档的顶层窗口
+    pub fn hwnd(&self) -> Result<i32> {
+        self.app.raw().get_obj("ActiveWindow", "ActiveWindow")?.get("Hwnd")?.int()
     }
 
     pub fn status(&mut self) -> Result<WordStatus> {
@@ -536,16 +546,32 @@ impl Session {
                 out.entries = self.history.list(&req.document_id);
             }
             HistoryAction::Clear => {
+                // 库内 journal 先清；软件自己的撤销栈清不掉（不支持 / 没有文档）就如实报错，
+                // 由宿主决定「只清列表」——不能一边说清空了、一边 Word 里还能 Ctrl+Z
                 self.history.clear();
+                let d = self.doc(&req.document_id)?;
+                crate::history::undo_clear(&d)?;
                 out.applied.push("clear".into());
             }
+            HistoryAction::BeginMark => {
+                let label = req.label.as_deref().unwrap_or("AI 操作");
+                crate::history::begin_mark(&self.app, label)?;
+                out.applied.push("begin_mark".into());
+            }
+            HistoryAction::EndMark => {
+                crate::history::end_mark(&self.app)?;
+                out.applied.push("end_mark".into());
+            }
             HistoryAction::Undo => {
-                crate::history::undo(&self.app)?;
+                // 撤销挂在 Document 上（Application 没有 Undo，见 history::undo）
+                let d = self.doc(&req.document_id)?;
+                crate::history::undo(&d)?;
                 self.bump(&req.document_id);
                 out.applied.push("undo".into());
             }
             HistoryAction::Redo => {
-                crate::history::redo(&self.app)?;
+                let d = self.doc(&req.document_id)?;
+                crate::history::redo(&d)?;
                 self.bump(&req.document_id);
                 out.applied.push("redo".into());
             }
@@ -706,6 +732,7 @@ pub fn handle(session: &mut Option<Session>, req: Request) -> Result<Response> {
                     dirty_policy,
                 } => Ok(Response::Status(s.switch_engine(engine, dirty_policy)?)),
                 Request::Status => Ok(Response::Status(s.status()?)),
+                Request::Hwnd => Ok(Response::Hwnd(s.hwnd()?)),
                 Request::ListDocuments => Ok(Response::Documents(s.list_documents()?)),
                 Request::Open { path, read_only } => {
                     Ok(Response::Document(s.open(&path, read_only)?))

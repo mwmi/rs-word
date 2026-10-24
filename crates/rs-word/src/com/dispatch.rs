@@ -11,7 +11,7 @@ use windows::core::{BSTR, GUID, PCWSTR};
 use windows::Win32::Globalization::LOCALE_USER_DEFAULT;
 use windows::Win32::System::Com::{
     IDispatch, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT,
-    DISPPARAMS,
+    DISPPARAMS, EXCEPINFO,
 };
 use windows::Win32::System::Ole::DISPID_PROPERTYPUT;
 use windows::Win32::System::Variant::{VARIANT, VT_DISPATCH};
@@ -21,8 +21,17 @@ use crate::error::WordError;
 
 const DISP_E_MEMBERNOTFOUND: u32 = 0x8002_0003;
 
+/// 该 HRESULT 是否属于「应用不认这组具名参数」——WPS 的 `Invoke` 对 `rgdispidNamedArgs`
+/// 支持不全，常见返回 0x0602xxxx「无此命令」。
+fn rejects_named_args(hr: u32) -> bool {
+    (hr & 0xFFFF_0000) == 0x0602_0000
+}
+
 /// 常见 HRESULT → 修复提示。
 fn common_hint(hr: u32) -> &'static str {
+    if rejects_named_args(hr) {
+        return "应用不认这组参数/成员（WPS 常见于具名参数）：改用位置参数或核对成员名";
+    }
     match hr {
         0x8002_0003 => "成员不存在：检查成员名拼写（可用 raw 命令探测）",
         0x8002_0005 => "类型不匹配：检查参数类型",
@@ -57,6 +66,33 @@ pub(crate) fn order_args(pos: Vec<ComValue>, named: Vec<ComValue>) -> Vec<ComVal
     p.reverse();
     out.extend(p);
     out
+}
+
+/// BSTR → String，空指针按空串处理。
+fn bstr_text(value: &BSTR) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+/// 调用失败时把应用抛出的 `EXCEPINFO` 拼进错误信息。
+///
+/// `0x80020009 发生意外` 只是外壳，真正原因（参数个数不对、插入位置无效、表格嵌套非法…）
+/// 在 `bstrSource` / `bstrDescription` 里。吞掉它等于让调用方对着「发生意外」猜。
+fn enrich(e: windows::core::Error, excep: &EXCEPINFO) -> windows::core::Error {
+    let desc = bstr_text(&excep.bstrDescription);
+    if desc.is_empty() {
+        return e;
+    }
+    let source = bstr_text(&excep.bstrSource);
+    let message = if source.is_empty() {
+        desc
+    } else {
+        format!("{source}: {desc}")
+    };
+    windows::core::Error::new(e.code(), message)
 }
 
 /// 包住一个 `IDispatch` 指针 + 对象路径。
@@ -135,17 +171,23 @@ impl IDispatchWrapper {
         params: &DISPPARAMS,
     ) -> windows::core::Result<VARIANT> {
         let mut result = VARIANT::default();
-        self.disp.Invoke(
+        // EXCEPINFO 一定要传实地址：传 null 时应用不会填，错误就只剩「发生意外」四个字。
+        let mut excep: EXCEPINFO = std::mem::zeroed();
+        let mut arg_err: u32 = 0;
+        let invoked = self.disp.Invoke(
             dispid,
             &GUID::default(),
             LOCALE_USER_DEFAULT,
             flags,
             params,
             Some(&mut result),
-            Some(std::ptr::null_mut()),
-            Some(std::ptr::null_mut()),
-        )?;
-        Ok(result)
+            Some(&mut excep),
+            Some(&mut arg_err),
+        );
+        match invoked {
+            Ok(()) => Ok(result),
+            Err(e) => Err(enrich(e, &excep)),
+        }
     }
 
     /// 读取属性，如 `get("Name")` / `get("Content")`。
@@ -224,7 +266,7 @@ impl IDispatchWrapper {
         .map_err(|e| com_err("dispid", name, &self.ctx, e))?;
 
         let named_vals: Vec<ComValue> = named.iter().map(|(_, v)| v.clone()).collect();
-        let ordered = order_args(args, named_vals);
+        let ordered = order_args(args.clone(), named_vals.clone());
         let variants: Vec<VARIANT> = ordered.into_iter().map(VARIANT::from).collect();
         let mut named_ids: Vec<i32> = dispids[1..].to_vec();
         let params = DISPPARAMS {
@@ -233,9 +275,15 @@ impl IDispatchWrapper {
             cArgs: variants.len() as u32,
             cNamedArgs: named_ids.len() as u32,
         };
-        unsafe { self.invoke_raw(dispids[0], DISPATCH_METHOD, &params) }
-            .map(|v| DispatchResult::new(v, &self.ctx))
-            .map_err(|e| com_err("call", name, &self.ctx, e).into())
+        match unsafe { self.invoke_raw(dispids[0], DISPATCH_METHOD, &params) } {
+            Ok(v) => Ok(DispatchResult::new(v, &self.ctx)),
+            // 调用点的具名参数都按签名顺序列出，被拒时按同一顺序降级为纯位置参数重试一次。
+            Err(e) if rejects_named_args(e.code().0 as u32) => {
+                let all: Vec<ComValue> = named_vals.into_iter().chain(args).collect();
+                self.call(name, all)
+            }
+            Err(e) => Err(com_err("call", name, &self.ctx, e).into()),
+        }
     }
 
     /// 写属性，如 `put("Text", vec!["新文本".into()])`。

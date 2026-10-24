@@ -206,6 +206,28 @@ pub enum Target {
         row: u32,
         column: u32,
     },
+    /// 整张表格（含表尾标记）。
+    Table {
+        document_id: String,
+        table_id: String,
+    },
+    /// 表格多选区：矩形（`row_start..=row_end` × `col_start..=col_end`）或零散单元格（`cells`）。
+    /// 某维起止都为 0 = 该维不限定 → 整表取满；只给一端 = 单行/单列。
+    TableCells {
+        document_id: String,
+        table_id: String,
+        #[serde(default)]
+        row_start: u32,
+        #[serde(default)]
+        row_end: u32,
+        #[serde(default)]
+        col_start: u32,
+        #[serde(default)]
+        col_end: u32,
+        /// 零散多选（同一行相邻列会自动合并成一段）；给了它就不看上面的矩形。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cells: Vec<CellRef>,
+    },
     HeaderFooter {
         document_id: String,
         #[serde(default = "default_one")]
@@ -214,6 +236,28 @@ pub enum Target {
         #[serde(default)]
         variant: HfVariant,
     },
+}
+
+/// 单元格引用（1 基）。`{"row":1,"column":2}` 与 `[1,2]` 都收。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CellRef {
+    Obj {
+        row: u32,
+        #[serde(alias = "col", alias = "col_index")]
+        column: u32,
+    },
+    Pair([u32; 2]),
+}
+
+impl CellRef {
+    /// （行, 列），均从 1 起。
+    pub fn rc(&self) -> (u32, u32) {
+        match self {
+            Self::Obj { row, column } => (*row, *column),
+            Self::Pair([row, column]) => (*row, *column),
+        }
+    }
 }
 
 fn default_one() -> u32 {
@@ -230,6 +274,8 @@ impl Target {
             | Self::Find { document_id, .. }
             | Self::Bookmark { document_id, .. }
             | Self::TableCell { document_id, .. }
+            | Self::Table { document_id, .. }
+            | Self::TableCells { document_id, .. }
             | Self::HeaderFooter { document_id, .. } => document_id,
         }
     }
@@ -1339,6 +1385,11 @@ pub enum HistoryAction {
     Redo,
     Checkpoint,
     Clear,
+    /// 开始一段自定义撤销记录（`Application.UndoRecord.StartCustomRecord`）：
+    /// 之后到 `EndMark` 之前的所有改动在原生撤销栈里合成一步。
+    BeginMark,
+    /// 结束自定义撤销记录（`Application.UndoRecord.EndCustomRecord`）。
+    EndMark,
 }
 
 /// 历史请求。
@@ -1348,6 +1399,9 @@ pub struct HistoryRequest {
     pub action: HistoryAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_dir: Option<String>,
+    /// `BeginMark` 用的记录名（显示在软件自己的撤销下拉里）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 // ───────────────────────── VBA ─────────────────────────

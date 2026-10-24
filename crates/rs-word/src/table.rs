@@ -9,7 +9,7 @@ use crate::document::Document;
 use crate::error::{hex_to_ole, WordError};
 use crate::range::Range;
 use crate::target::resolve;
-use crate::types::{CellRange, TableAction, TableRequest, TableResult, TableSummary};
+use crate::types::{CellRange, TableAction, TableRequest, TableResult, TableSummary, Target};
 
 /// 表格动作执行入口。
 pub fn exec(
@@ -299,6 +299,20 @@ fn table(doc: &Document, req: &TableRequest) -> Result<crate::com::dispatch::IDi
         .idispatch_child(id)
 }
 
+/// 最后一张表的 `Range.End`；没有表格时为 None。
+fn last_table_end(doc: &Document) -> Result<Option<i32>> {
+    let tables = doc.tables()?;
+    let count = tables.get("Count")?.int()?;
+    if count <= 0 {
+        return Ok(None);
+    }
+    let table = tables
+        .call("Item", vec![ComValue::Int(count)])?
+        .idispatch_child("Table")?;
+    let range = table.get_obj("Range", "Range")?;
+    Ok(Some(range.get("End")?.int()?))
+}
+
 fn cell_of(
     doc: &Document,
     req: &TableRequest,
@@ -306,13 +320,10 @@ fn cell_of(
     column: u32,
 ) -> Result<crate::com::dispatch::IDispatchWrapper> {
     table(doc, req)?
-        .call_named(
+        // 位置参数：WPS 的 Invoke 对具名参数支持不全（0x0602xxxx「无此命令」）。
+        .call(
             "Cell",
-            vec![],
-            &[
-                ("Row", ComValue::Int(row as i32)),
-                ("Column", ComValue::Int(column as i32)),
-            ],
+            vec![ComValue::Int(row as i32), ComValue::Int(column as i32)],
         )?
         .idispatch_child("Cell")
 }
@@ -329,32 +340,80 @@ fn create(app: &App, doc: &Document, req: &TableRequest) -> Result<(String, Tabl
         );
     }
     let rows = req.data.len();
-    let target = req
-        .target
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("create 需要 target 定位插入点"))?;
-    let at = resolve(app, doc, target)?.range.collapse_end()?;
-    let t = doc.tables()?.call_named(
-        "Add",
-        vec![],
-        &[
-            ("Range", ComValue::Obj(at.raw().disp.clone())),
-            ("NumRows", ComValue::Int(rows as i32)),
-            ("NumColumns", ComValue::Int(cols as i32)),
-            ("DefaultTableBehavior", ComValue::Int(1)),
-            ("AutoFitBehavior", ComValue::Int(2)),
-        ],
-    )?;
+    // 文末插入：target 省略与 kind=document 同义。Content 折叠到 End 会落在文档终止符之后
+    // （不可编辑），Tables.Add 在该点建不出表，统一取最后一个可编辑位置。
+    let at_document = matches!(req.target.as_ref(), None | Some(Target::Document { .. }));
+    let mut at = match req.target.as_ref() {
+        None | Some(Target::Document { .. }) => doc.end_range()?,
+        Some(target) => resolve(app, doc, target)?.range.collapse_end()?,
+    };
+    // 文档以表格结尾时落点紧贴最后一张表：`Tables.Add` 会被引擎当成「往原表加行」
+    // （实测 WPS：新表直接并进旧表），先补一个表格后的段落再重新取落点。
+    if at_document {
+        if let Some(table_end) = last_table_end(doc)? {
+            if at.start()? <= table_end {
+                doc.content()?.insert_paragraph_after()?;
+                at = doc.end_range()?;
+            }
+        }
+    }
+    // 位置参数只给前三个：`Tables.Add(Range, NumRows, NumColumns)`。
+    // 后两个（DefaultTableBehavior / AutoFitBehavior）在 WPS 里支持不全，多传会直接
+    // 0x80020009「发生意外」；省掉后由引擎用自己的默认表行为，Word 侧结果一致。
+    let add = |point: &Range| {
+        doc.tables().and_then(|tables| {
+            tables.call(
+                "Add",
+                vec![
+                    ComValue::Obj(point.raw().disp.clone()),
+                    ComValue::Int(rows as i32),
+                    ComValue::Int(cols as i32),
+                ],
+            )
+        })
+    };
+    // 0x80020009 本身不带信息，失败时把落点/表数/尺寸写进提示，能直接区分是哪种落点被拒。
+    let diag = |point: &Range| {
+        format!(
+            "落点={} 文档表数={} 目标={}行×{}列",
+            point
+                .start()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| "?".to_string()),
+            doc.tables()
+                .and_then(|t| t.get("Count"))
+                .and_then(|v| v.int())
+                .unwrap_or(-1),
+            rows,
+            cols
+        )
+    };
+    let t = match add(&at) {
+        Ok(t) => t,
+        Err(first) if at_document => {
+            // 兜底：落点紧贴表格或贴在受保护区边缘时引擎会拒绝，退到文末新段落再试一次。
+            let _ = doc.content().and_then(|c| c.insert_paragraph_after());
+            at = doc.end_range()?;
+            add(&at).map_err(|second| {
+                WordError::hint(
+                    second,
+                    format!("{}；文末补段落重试仍失败，首次：{first}", diag(&at)),
+                )
+            })?
+        }
+        Err(e) => return Err(WordError::hint(e, diag(&at))),
+    };
     let t = t.idispatch_child("Table")?;
+    // 观感项：表格已经建好，取不到自动适应也不该把整次调用判成失败。
+    let _ = t.call("AutoFitBehavior", vec![ComValue::Int(2)]);
     // 一次填充：逐格写 body range（跳过单元格终止符）。
     for (ri, row) in req.data.iter().enumerate() {
         for (ci, value) in row.iter().enumerate() {
-            let cell = t.call_named(
+            let cell = t.call(
                 "Cell",
-                vec![],
-                &[
-                    ("Row", ComValue::Int((ri + 1) as i32)),
-                    ("Column", ComValue::Int((ci + 1) as i32)),
+                vec![
+                    ComValue::Int((ri + 1) as i32),
+                    ComValue::Int((ci + 1) as i32),
                 ],
             )?;
             let cr = Range::new(
@@ -368,12 +427,16 @@ fn create(app: &App, doc: &Document, req: &TableRequest) -> Result<(String, Tabl
         }
     }
     if req.header_rows > 0 {
-        let rows_coll = t.get_obj("Rows", "Rows")?;
-        for i in 1..=req.header_rows.min(rows as u32) {
-            rows_coll
-                .call("Item", vec![ComValue::Int(i as i32)])?
-                .idispatch_child("Row")?
-                .put("HeadingFormat", vec![ComValue::Bool(true)])?;
+        // 表头重复只是锦上添花：数据已经写完，这一步失败不该让调用方以为整张表没建。
+        if let Ok(rows_coll) = t.get_obj("Rows", "Rows") {
+            for i in 1..=req.header_rows.min(rows as u32) {
+                let row = rows_coll
+                    .call("Item", vec![ComValue::Int(i as i32)])
+                    .and_then(|r| r.idispatch_child("Row"));
+                if let Ok(row) = row {
+                    let _ = row.put("HeadingFormat", vec![ComValue::Bool(true)]);
+                }
+            }
         }
     }
     let count = doc.table_count().unwrap_or(0);
