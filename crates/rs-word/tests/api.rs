@@ -217,6 +217,7 @@ fn revision_filter_matching() {
         date: None,
         quote: "新增".into(),
         start: Some(10),
+        end: Some(12),
         text_hash: "sha256:x".into(),
         doc_version: 1,
     };

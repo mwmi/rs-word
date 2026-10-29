@@ -299,20 +299,6 @@ fn table(doc: &Document, req: &TableRequest) -> Result<crate::com::dispatch::IDi
         .idispatch_child(id)
 }
 
-/// 最后一张表的 `Range.End`；没有表格时为 None。
-fn last_table_end(doc: &Document) -> Result<Option<i32>> {
-    let tables = doc.tables()?;
-    let count = tables.get("Count")?.int()?;
-    if count <= 0 {
-        return Ok(None);
-    }
-    let table = tables
-        .call("Item", vec![ComValue::Int(count)])?
-        .idispatch_child("Table")?;
-    let range = table.get_obj("Range", "Range")?;
-    Ok(Some(range.get("End")?.int()?))
-}
-
 fn cell_of(
     doc: &Document,
     req: &TableRequest,
@@ -350,7 +336,7 @@ fn create(app: &App, doc: &Document, req: &TableRequest) -> Result<(String, Tabl
     // 文档以表格结尾时落点紧贴最后一张表：`Tables.Add` 会被引擎当成「往原表加行」
     // （实测 WPS：新表直接并进旧表），先补一个表格后的段落再重新取落点。
     if at_document {
-        if let Some(table_end) = last_table_end(doc)? {
+        if let Some(table_end) = doc.last_table_end() {
             if at.start()? <= table_end {
                 doc.content()?.insert_paragraph_after()?;
                 at = doc.end_range()?;

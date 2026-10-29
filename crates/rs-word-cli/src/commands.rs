@@ -270,6 +270,11 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 action: LayoutAction::ExportPdf,
                 page: None,
                 header_footer: None,
+                toc: None,
+                watermark: None,
+                numbering: None,
+                page_number: None,
+                header_footer_zones: None,
                 pdf_path: Some(path.to_string()),
                 overwrite,
             }))?;
@@ -405,6 +410,10 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 list: Some(kind),
                 list_template: None,
                 reset: None,
+                profile: None,
+                assignments: None,
+                dry_run: false,
+                reset_font: false,
             }))?;
         }
         "table" => table(st, args, rl)?,
@@ -439,6 +448,11 @@ fn run(st: &mut State, cmd: &str, args: &str, rl: &mut ReplEditor) -> Result<()>
                 action: LayoutAction::UpdateFields,
                 page: None,
                 header_footer: None,
+                toc: None,
+                watermark: None,
+                numbering: None,
+                page_number: None,
+                header_footer_zones: None,
                 pdf_path: None,
                 overwrite: false,
             }))?;
@@ -738,6 +752,10 @@ fn format_cmd(st: &mut State, args: &str) -> Result<()> {
         list,
         list_template,
         reset: None,
+        profile: None,
+        assignments: None,
+        dry_run: false,
+        reset_font: false,
     }))
 }
 
@@ -981,6 +999,11 @@ fn page(st: &mut State, args: &str) -> Result<()> {
         action: LayoutAction::SetPageSetup,
         page: Some(page),
         header_footer: None,
+        toc: None,
+        watermark: None,
+        numbering: None,
+        page_number: None,
+        header_footer_zones: None,
         pdf_path: None,
         overwrite: false,
     }))
@@ -1007,6 +1030,11 @@ fn header_footer(st: &mut State, args: &str, kind: &str) -> Result<()> {
             alignment: None,
             link_to_previous: false,
         }),
+        toc: None,
+        watermark: None,
+        numbering: None,
+        page_number: None,
+        header_footer_zones: None,
         pdf_path: None,
         overwrite: false,
     }))
@@ -1069,6 +1097,7 @@ fn review(st: &mut State, args: &str) -> Result<()> {
         comment_id: None,
         confirm,
         filter: filtered.then_some(filter),
+        view: None,
         limit: 50,
     }))
 }

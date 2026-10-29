@@ -148,6 +148,68 @@ impl IDispatchWrapper {
         self.get_dispid(name).is_ok()
     }
 
+    /// 该对象是否真的有这个成员。
+    ///
+    /// WPS 与 Word 的公式对象差异很大（同一个 `OMaths.Add` 可能返回 OMath 也可能返回 Range，
+    /// `BuildUp` 也可能不存在）；先用 GetIDsOfNames 探一下，避免直接抛 0x80020006。
+    pub fn has(&self, name: &str) -> bool {
+        self.get_dispid(name).is_ok()
+    }
+
+    /// 该对象类型信息里的全部成员名 —— 相当于「反汇编」这个 COM 接口，别再猜名字。
+    ///
+    /// 对象没提供类型库（GetTypeInfoCount=0）时返回空表。
+    pub fn members(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        unsafe {
+            let count = match self.disp.GetTypeInfoCount() {
+                Ok(count) => count,
+                Err(_) => return out,
+            };
+            if count == 0 {
+                return out;
+            }
+            let info = match self.disp.GetTypeInfo(0, LOCALE_USER_DEFAULT) {
+                Ok(info) => info,
+                Err(_) => return out,
+            };
+            let attrs = match info.GetTypeAttr() {
+                Ok(attrs) if !attrs.is_null() => attrs,
+                _ => return out,
+            };
+            let funcs = (*attrs).cFuncs;
+            for index in 0..funcs {
+                let desc = match info.GetFuncDesc(index as u32) {
+                    Ok(desc) if !desc.is_null() => desc,
+                    _ => continue,
+                };
+                let memid = (*desc).memid;
+                info.ReleaseFuncDesc(desc);
+                let mut name = BSTR::new();
+                let mut doc = BSTR::new();
+                let mut help = 0u32;
+                let mut file = BSTR::new();
+                if info
+                    .GetDocumentation(
+                        memid,
+                        Some(&mut name),
+                        Some(&mut doc),
+                        &mut help,
+                        Some(&mut file),
+                    )
+                    .is_ok()
+                {
+                    let name = name.to_string();
+                    if !name.is_empty() && !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+            info.ReleaseTypeAttr(attrs);
+        }
+        out
+    }
+
     fn get_dispid(&self, name: &str) -> windows::core::Result<i32> {
         let bstr = BSTR::from(name);
         let names = [PCWSTR(bstr.as_ptr())];

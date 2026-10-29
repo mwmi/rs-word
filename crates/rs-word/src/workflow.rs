@@ -14,6 +14,7 @@ use crate::app::App;
 use crate::com::variant::ComValue;
 use crate::document::Document;
 use crate::error::{SideEffectStatus, WordError};
+use crate::range::Range;
 use crate::target::resolve;
 use crate::types::{
     ActionResult, Story, Target, TextAnchor, WorkflowApplyMode, WorkflowApplyRequest,
@@ -164,32 +165,58 @@ pub fn apply(
         .into());
     }
 
+    // 预检：把定位不到的条目挑出来逐条跳过，别因为一条过期就让整批白跑；
+    // 全部定位不到才算整批失败（目标和文档根本对不上，重发也没用）。
+    let mut stale: Vec<Option<anyhow::Error>> =
+        (0..req.changes.len()).map(|_| None).collect();
     if req.validate_first {
         for (i, ch) in req.changes.iter().enumerate() {
             if let Err(e) = resolve(app, doc, &ch.target) {
-                let terr = crate::error::ToolError::from_anyhow(&e);
-                return Err(WordError::new(
-                    "workflow.apply",
-                    doc.label(),
-                    format!("第 {i} 条变更预检失败（{}）：{}", terr.code, terr.message),
-                )
-                .with_hint("全部变更未应用；重新 prepare 后重发")
-                .into());
+                stale[i] = Some(e);
             }
+        }
+        if !stale.is_empty() && stale.iter().all(Option::is_some) {
+            let terr = crate::error::ToolError::from_anyhow(stale[0].as_ref().unwrap());
+            return Err(WordError::new(
+                "workflow.apply",
+                doc.label(),
+                format!(
+                    "{} 条变更都定位不到（{}）：{}",
+                    req.changes.len(),
+                    terr.code,
+                    terr.message
+                ),
+            )
+            .with_hint("目标和文档对不上：重新 prepare 取新锚点，别原样重发")
+            .into());
         }
     }
 
     let mut results = Vec::with_capacity(req.changes.len());
     let mut warnings = Vec::new();
+    // 真正写进文档的条数：与 applied（含「无变化跳过」）分开，版本号只看这个
+    let mut touched = 0usize;
     for (i, ch) in req.changes.iter().enumerate() {
         let op = classify(ch, req);
+        if let Some(e) = &stale[i] {
+            // 只进 results（failed）：再推一条 warning 会让 skipped 与 failed 重复计数
+            results.push(failed_result(i, op, e, false));
+            continue;
+        }
+        // 失败时用来判断这条是否其实已经写进去了（见下面的 Err 分支）
+        let before = doc.revision_count().unwrap_or(0);
         match apply_one(app, doc, ch, op, req.apply_mode) {
-            Ok(summary) => {
+            Ok((summary, wrote)) => {
                 if op == EffectiveOp::Comment && ch.op != WorkflowChangeOp::Comment {
                     warnings.push(format!(
                         "第 {i} 条置信度 {:?} 低于阈值 {}：已降级为批注",
                         ch.confidence, req.comment_below_confidence
                     ));
+                }
+                if wrote {
+                    touched += 1;
+                } else {
+                    warnings.push(format!("第 {i} 条未改动：{summary}"));
                 }
                 results.push(ActionResult {
                     index: i,
@@ -197,21 +224,19 @@ pub fn apply(
                     ok: true,
                     summary,
                     target: None,
+                    warnings: Vec::new(),
                     reversible: true,
                     error_code: None,
                 });
             }
             Err(e) => {
-                let terr = crate::error::ToolError::from_anyhow(&e);
-                results.push(ActionResult {
-                    index: i,
-                    op: op_name(op),
-                    ok: false,
-                    summary: terr.message.clone(),
-                    target: None,
-                    reversible: false,
-                    error_code: Some(terr.code),
-                });
+                // 校验失败 ≠ 没写：修订模式下文档可能已经变了。如实记账，
+                // 回执才不会自称 not_applied 骗模型原样重发（那会把正文写重）。
+                let wrote = doc.revision_count().unwrap_or(0) > before;
+                if wrote {
+                    touched += 1;
+                }
+                results.push(failed_result(i, op, &e, wrote));
             }
         }
     }
@@ -219,11 +244,11 @@ pub fn apply(
     let applied = results.iter().filter(|r| r.ok).count();
     let failed = results.len() - applied;
     let skipped = warnings.len();
-    let side_effect_status = if failed == 0 && applied == 0 {
+    let side_effect_status = if failed == 0 && touched == 0 {
         SideEffectStatus::NotApplied
     } else if failed == 0 {
         SideEffectStatus::Applied
-    } else if applied == 0 {
+    } else if touched == 0 {
         SideEffectStatus::NotApplied
     } else {
         SideEffectStatus::PartiallyApplied
@@ -231,7 +256,7 @@ pub fn apply(
     Ok(WorkflowApplyResult {
         document_id: doc.id().to_string(),
         operation_id: crate::new_operation_id(),
-        doc_version: doc_version + u64::from(applied > 0),
+        doc_version: doc_version + u64::from(touched > 0),
         applied,
         failed,
         skipped,
@@ -277,6 +302,7 @@ pub fn validate(
                 ok: true,
                 summary: "预检通过（未写入）".into(),
                 target: None,
+                warnings: Vec::new(),
                 reversible: true,
                 error_code: None,
             }),
@@ -288,6 +314,7 @@ pub fn validate(
                     ok: false,
                     summary: terr.message.clone(),
                     target: None,
+                    warnings: Vec::new(),
                     reversible: false,
                     error_code: Some(terr.code),
                 });
@@ -353,13 +380,38 @@ fn op_name(op: EffectiveOp) -> String {
     .to_string()
 }
 
+/// 单条失败的回执（预检与应用共用，两处的拼装口径必须一致）。
+fn failed_result(index: usize, op: EffectiveOp, e: &anyhow::Error, wrote: bool) -> ActionResult {
+    let terr = crate::error::ToolError::from_anyhow(e);
+    let message = format!(
+        "{}{}",
+        terr.message,
+        if wrote {
+            "（已写入文档，先核对再补发，别重发）"
+        } else {
+            ""
+        }
+    );
+    ActionResult {
+        index,
+        op: op_name(op),
+        ok: false,
+        summary: message,
+        target: None,
+        warnings: Vec::new(),
+        reversible: false,
+        error_code: Some(terr.code),
+    }
+}
+
+/// 返回 (摘要, 是否真的改了文档)：`false` = 原文与新文本一致，什么都没写。
 fn apply_one(
     app: &App,
     doc: &Document,
     ch: &WorkflowChange,
     op: EffectiveOp,
     mode: WorkflowApplyMode,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let resolved = resolve(app, doc, &ch.target)?;
     let range = resolved.range;
     // 逐条应用前重新核对锚点（前面变更可能已移动位置）。
@@ -383,21 +435,36 @@ fn apply_one(
                     ("Text", ComValue::Str(text.clone())),
                 ],
             )?;
-            Ok(format!("批注 {}", anchors::quote(&text, 40)))
+            Ok((format!("批注 {}", anchors::quote(&text, 40)), true))
         }
         EffectiveOp::Replace => {
             let text = ch.text.as_ref().ok_or_else(|| {
                 WordError::new("workflow.apply", doc.label(), "replace 需要 text")
             })?;
+            // 回读范围只到有效文本：尾部段落标记 / 单元格结束符不算正文，
+            // 一并替换会把两段并成一段（模型抄锚点时也常把它带上）。
+            let old = anchors::display_text(&range.text().unwrap_or_default());
+            if same_content(&old, text) {
+                return Ok(("原文与新文本一致，未改动".into(), false));
+            }
+            let before = doc.revision_count().unwrap_or(0);
             let run = || -> Result<()> {
-                range.set_text(text)?;
-                let got = range.text().unwrap_or_default();
-                if !got.contains(text.as_str()) {
+                write_diff(&range, &old, text)?;
+                // 修订模式下 `Range.Text` 是「新插入 + 已标记删除的旧文」的混合，
+                // 拿它跟新文本比相等**永远不成立**（实报：整批报「回读不匹配」，
+                // 文档其实已写入，模型据此改用 direct 重发，把正文写成新旧混杂）。
+                // 所以文本相等只是其中一种证据，另一种是「修订数确实多出来了」。
+                let got = anchors::display_text(&range.text().unwrap_or_default());
+                let verified = same_content(&got, text)
+                    || (mode == WorkflowApplyMode::TrackChanges
+                        && doc.revision_count().unwrap_or(0) > before);
+                if !verified {
                     return Err(WordError::new(
                         "workflow.apply",
                         range.label(),
                         "写入后回读不匹配",
                     )
+                    .with_hint("先 word_read 核对现状再决定是否补发，别原样重发")
                     .into());
                 }
                 Ok(())
@@ -407,12 +474,23 @@ fn apply_one(
             } else {
                 run()?;
             }
-            Ok(format!("替换为 {} 字", text.chars().count()))
+            let (_, removed, added) = minimal_edit(&old, text);
+            Ok((
+                format!(
+                    "改 {} 字 → {} 字（只动变化片段）",
+                    removed.chars().count(),
+                    added.chars().count()
+                ),
+                true,
+            ))
         }
         EffectiveOp::InsertAfter => {
             let text = ch.text.as_ref().ok_or_else(|| {
                 WordError::new("workflow.apply", doc.label(), "insert_after 需要 text")
             })?;
+            if text.is_empty() {
+                return Ok(("插入文本为空，未改动".into(), false));
+            }
             let run = || -> Result<()> {
                 range.collapse_end()?.insert_after(text)?;
                 Ok(())
@@ -422,9 +500,77 @@ fn apply_one(
             } else {
                 run()?;
             }
-            Ok(format!("末尾插入 {} 字", text.chars().count()))
+            Ok((format!("末尾插入 {} 字", text.chars().count()), true))
         }
     }
+}
+
+/// 把范围文本换成 `new`，但**只动首尾公共部分之间的差异片段**。
+///
+/// 整段 `Range.Text = new` 在修订模式下会把整句标成「删除 + 插入」：
+/// 校对只改一个标点，审阅面板里看起来却像整行被删（实报）。缩到差异片段后，
+/// 修订里只出现真正改动的字，纯删除（new 为空）也只留一条删除。
+fn write_diff(range: &Range, old: &str, new: &str) -> Result<()> {
+    // 含图片/脚注等对象时字符偏移不可靠：退回整段替换
+    if old.chars().any(|c| c.is_control() && c != '\r' && c != '\t') {
+        return range.set_text(new);
+    }
+    let base = range.start()?;
+    let (prefix, removed, added) = minimal_edit(old, new);
+    if removed.is_empty() {
+        let at = base + prefix as i32;
+        return range.narrowed(at, at)?.insert_after(&added);
+    }
+    // Word 的 Range 位置按 UTF-16 计，不能用 String::len（字节）
+    let width = removed.encode_utf16().count() as i32;
+    let sub = range.narrowed(base + prefix as i32, base + prefix as i32 + width)?;
+    if added.is_empty() {
+        sub.delete()
+    } else {
+        sub.set_text(&added)
+    }
+}
+
+/// 最小差异：(公共前缀 UTF-16 长度, 被替换掉的旧片段, 新片段)。
+fn minimal_edit(old: &str, new: &str) -> (usize, String, String) {
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = new.chars().collect();
+    let mut head = 0;
+    while head < o.len() && head < n.len() && o[head] == n[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < o.len() - head
+        && tail < n.len() - head
+        && o[o.len() - 1 - tail] == n[n.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    let prefix: usize = o[..head].iter().map(|c| c.len_utf16()).sum();
+    let removed: String = o[head..o.len() - tail].iter().collect();
+    let added: String = n[head..n.len() - tail].iter().collect();
+    (prefix, removed, added)
+}
+
+/// 只差空白（含首尾、全角空格）就视为同一段文本：这种「改动」不该进修订。
+fn same_content(a: &str, b: &str) -> bool {
+    fn squeeze(s: &str) -> String {
+        let mut out = String::new();
+        let mut space = false;
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                space = true;
+                continue;
+            }
+            if space && !out.is_empty() {
+                out.push(' ');
+            }
+            space = false;
+            out.push(ch);
+        }
+        out
+    }
+    squeeze(a) == squeeze(b)
 }
 
 /// 批注文本：`reason` 在前、`text` 在后（模型可只给其一）。

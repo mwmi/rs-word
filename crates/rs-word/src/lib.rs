@@ -31,6 +31,7 @@ pub mod find;
 pub mod format;
 pub mod history;
 pub mod layout;
+pub mod math;
 pub mod media;
 pub mod process;
 pub mod range;
@@ -43,6 +44,7 @@ pub mod tools;
 pub mod types;
 pub mod vba;
 pub mod workflow;
+pub mod write;
 
 pub use client::WordClient;
 pub use error::{hex_to_ole, ole_to_hex, rgb, Category, SideEffectStatus, ToolError, WordError};

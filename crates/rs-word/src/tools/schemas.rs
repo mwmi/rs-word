@@ -104,7 +104,7 @@ pub fn tool_definitions() -> Value {
         {
             "type": "function",
             "name": "word_edit",
-            "description": "文本插入/替换/删除、段落、分页分节符、书签、超链接、字段、套样式；一次提交多动作。",
+            "description": "文本插入/替换/删除、段落、分页分节符、书签、超链接、字段、套样式、LaTeX 转公式（convert_math：全文 `$…$` 行内 / `$$…$$` 独立）；一次提交多动作。",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -219,7 +219,7 @@ pub fn tool_definitions() -> Value {
                     "comment_id": {"type": ["string","null"]},
                     "confirm": {"type": ["string","null"]},
                     "filter": {"type": ["object","null"], "additionalProperties": true,
-                               "description": "{authors:[..], kinds:[insert|delete|format|...], max}"},
+                               "description": "{authors:[..], kinds:[insert|delete|property|style|...], max}"},
                     "limit": {"type": ["integer","null"]}
                 },
                 "required": ["document_id", "action"]

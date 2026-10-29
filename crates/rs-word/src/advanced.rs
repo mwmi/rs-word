@@ -355,6 +355,13 @@ pub fn snapshot(doc: &Document, doc_version: u64, max_items: usize) -> Result<St
         tables,
         note_count: count_of(doc, "Footnotes") + count_of(doc, "Endnotes"),
         media_count: count_of(doc, "Shapes") + count_of(doc, "InlineShapes"),
+        toc_count: count_of(doc, "TablesOfContents") as i32,
+        // wdStatisticPages = 2；大文档算一次要几十毫秒，取不到就是 0（界面不显示即可）
+        page_count: doc
+            .raw()
+            .call("ComputeStatistics", vec![ComValue::Int(2)])
+            .and_then(|v| v.int())
+            .unwrap_or(0),
     })
 }
 

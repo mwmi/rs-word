@@ -127,6 +127,33 @@ impl Document {
         self.raw.get_obj("Tables", "Tables")
     }
 
+    /// 第 `index` 张表的 `Range`；没有该表或探测失败时为 None（探测不该让主流程失败）。
+    fn table_range(&self, index: i32) -> Option<Range> {
+        self.tables()
+            .ok()?
+            .call("Item", vec![ComValue::Int(index)])
+            .ok()?
+            .idispatch_child("Table")
+            .ok()?
+            .get_obj("Range", "Table.Range")
+            .ok()
+            .map(Range::new)
+    }
+
+    /// 第一张表的 `Range.Start`；没有表格时为 None。
+    pub fn first_table_start(&self) -> Option<i32> {
+        self.table_range(1)?.start().ok()
+    }
+
+    /// 最后一张表的 `Range.End`；没有表格时为 None。
+    pub fn last_table_end(&self) -> Option<i32> {
+        let count = self.table_count()?;
+        if count == 0 {
+            return None;
+        }
+        self.table_range(count as i32)?.end().ok()
+    }
+
     pub fn track_revisions(&self) -> Result<bool> {
         self.raw.get("TrackRevisions")?.bool()
     }

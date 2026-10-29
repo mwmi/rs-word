@@ -15,19 +15,84 @@ use crate::range::Range;
 use crate::target::resolve;
 use crate::types::{
     CommentInfo, ReviewAction, ReviewRequest, ReviewResult, RevisionFilter, RevisionInfo,
+    ViewSettings,
 };
 
-/// 修订类型码 → 可读名。
+/// 文档窗口的 `View` 对象。
+///
+/// 用 `Document.ActiveWindow` 而不是 `Application.ActiveWindow`：前者**按文档**取窗口，
+/// 目标文档不在前台也能读写它的显示方式（右栏要能管后台那份文档）。
+fn view_of(doc: &Document) -> Result<IDispatchWrapper> {
+    doc.raw()
+        .get_obj("ActiveWindow", "Window")?
+        .get_obj("View", "View")
+}
+
+/// 读当前显示方式：个别成员读不到就按「开着」兜底，别因为一个属性让整块空着。
+fn read_view(doc: &Document) -> Result<ViewSettings> {
+    let view = view_of(doc)?;
+    let on = |name: &str| view.get(name).and_then(|v| v.bool()).unwrap_or(true);
+    // WdRevisionsMode：0 = 批注框（右侧气球），1 = 嵌入正文
+    let mode = match view.get("MarkupMode").and_then(|v| v.int()).unwrap_or(1) {
+        0 => "balloon",
+        _ => "inline",
+    };
+    Ok(ViewSettings {
+        markup_mode: Some(mode.to_string()),
+        show_markup: Some(on("ShowRevisionsAndComments")),
+        show_comments: Some(on("ShowComments")),
+        show_insertions: Some(on("ShowInsertionsAndDeletions")),
+        show_format: Some(on("ShowFormatChanges")),
+    })
+}
+
+/// 写显示方式：只改带上的字段。
+fn apply_view(doc: &Document, want: &ViewSettings) -> Result<()> {
+    let view = view_of(doc)?;
+    if let Some(mode) = want.markup_mode.as_deref() {
+        // 不认识的取值直接报错：静默当成嵌入，用户只会看到「点了没反应」
+        let code = match mode {
+            "inline" => 1,
+            "balloon" => 0,
+            other => anyhow::bail!("markup_mode 只认 inline / balloon，收到 '{other}'"),
+        };
+        view.put("MarkupMode", vec![code.into()])?;
+    }
+    for (name, value) in [
+        ("ShowRevisionsAndComments", want.show_markup),
+        ("ShowComments", want.show_comments),
+        ("ShowInsertionsAndDeletions", want.show_insertions),
+        ("ShowFormatChanges", want.show_format),
+    ] {
+        if let Some(on) = value {
+            view.put(name, vec![on.into()])?;
+        }
+    }
+    Ok(())
+}
+
+/// 修订类型码 → 可读名（`WdRevisionType`：**1=insert、2=delete**）。
+///
+/// 这张表曾在 1/2 上整体错位一位：插入被报成 delete、删除被报成 property，
+/// 于是「修改」在回执里全成了删除（实报：校对后一键看全是删除）。
 fn revision_type_name(code: i32) -> String {
     match code {
-        0 => "insert".into(),
-        1 => "delete".into(),
-        2 => "property".into(),
-        3 => "paragraph_property".into(),
-        5 => "format".into(),
-        10 => "style".into(),
-        11 => "comment".into(),
-        12 => "field".into(),
+        0 => "none".into(),
+        1 => "insert".into(),
+        2 => "delete".into(),
+        3 => "property".into(),
+        4 => "paragraph_number".into(),
+        5 => "display_field".into(),
+        6 => "reconcile".into(),
+        7 => "conflict".into(),
+        8 => "style".into(),
+        9 => "replace".into(),
+        10 => "paragraph_property".into(),
+        11 => "table_property".into(),
+        12 => "section_property".into(),
+        13 => "style_definition".into(),
+        14 => "moved_from".into(),
+        15 => "moved_to".into(),
         _ => format!("type_{code}"),
     }
 }
@@ -40,7 +105,10 @@ pub fn revision_info(rev: &IDispatchWrapper, index: u32, doc_version: u64) -> Re
     let range = Range::new(rev.get_obj("Range", "Revision.Range")?);
     let text = range.text().unwrap_or_default();
     let hash = anchors::hash_text(&text);
-    let short = &hash[7..15.min(hash.len())];
+    // hash 自带 "sha256:" 前缀：ref 里只放十六进制段的前 8 位。
+    // 旧写法按下标盲切（&hash[7..15]）看着等价，实际把前缀长度写死了；
+    // 而校验处拿这 8 位去 starts_with 带前缀的全量 hash，**永远不成立**（见下方 accept/reject）。
+    let short: String = hash.strip_prefix("sha256:").unwrap_or(&hash).chars().take(8).collect();
     Ok(RevisionInfo {
         revision_ref: format!("rev_{index}_{short}"),
         index,
@@ -49,6 +117,7 @@ pub fn revision_info(rev: &IDispatchWrapper, index: u32, doc_version: u64) -> Re
         date,
         quote: anchors::quote(&text, 60),
         start: range.start().ok(),
+        end: range.end().ok(),
         text_hash: hash,
         doc_version,
     })
@@ -82,6 +151,7 @@ pub fn exec(
         operation_id: crate::new_operation_id(),
         doc_version,
         tracking: doc.track_revisions().unwrap_or(false),
+        view: None,
         revisions: Vec::new(),
         comments: Vec::new(),
         applied: Vec::new(),
@@ -89,7 +159,14 @@ pub fn exec(
         skipped: 0,
     };
     match req.action {
-        ReviewAction::Status => {}
+        // 显示方式顺带带上：右栏的修订弹层要它，这里不多花一趟 COM
+        ReviewAction::Status => result.view = read_view(doc).ok(),
+        ReviewAction::ViewStatus => result.view = Some(read_view(doc)?),
+        ReviewAction::SetView => {
+            apply_view(doc, req.view.as_ref().unwrap_or(&ViewSettings::default()))?;
+            result.applied.push("set_view".into());
+            result.view = Some(read_view(doc)?);
+        }
         ReviewAction::SetTracking => {
             let on = req.enabled.unwrap_or(true);
             doc.set_track_revisions(on)?;
@@ -118,7 +195,9 @@ pub fn exec(
                 .call("Item", vec![ComValue::Int(idx)])?
                 .idispatch_child("Revision")?;
             let current = revision_info(&rev, idx as u32, doc_version)?;
-            if !current.text_hash.starts_with(&hash) {
+            // 比的是 hash 的十六进制段：text_hash 形如 "sha256:<hex>"，直接 starts_with 短 hash 恒不成立
+            let current_hex = current.text_hash.strip_prefix("sha256:").unwrap_or(&current.text_hash);
+            if !current_hex.starts_with(&hash) {
                 return Err(WordError::new(
                     "review",
                     doc.label(),
@@ -252,16 +331,11 @@ fn batch_filtered(
     let mut applied = Vec::new();
     let mut nonmatching = 0u32;
     let mut failed = 0u32;
-    let mut idx = doc
-        .raw()
-        .get_obj("Revisions", "Revisions")?
-        .get("Count")?
-        .int()
-        .unwrap_or(0);
+    // 集合取一次：原先每轮都 get_obj 一遍，几百条修订就是几百次多余 COM
+    let revisions = doc.raw().get_obj("Revisions", "Revisions")?;
+    let mut idx = revisions.get("Count")?.int().unwrap_or(0);
     while idx >= 1 && applied.len() < cap as usize {
-        let rev = doc
-            .raw()
-            .get_obj("Revisions", "Revisions")?
+        let rev = revisions
             .call("Item", vec![ComValue::Int(idx)])?
             .idispatch_child(&format!("Revision[{idx}]"))?;
         let info = revision_info(&rev, idx as u32, doc_version)?;

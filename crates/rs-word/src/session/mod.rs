@@ -626,7 +626,16 @@ impl Session {
         let d = self.doc(&req.document_id)?;
         let v = self.version(&req.document_id);
         let r = crate::advanced::exec(&self.app, &d, req, v)?;
-        if !r.applied.is_empty() {
+        // 只读动作（结构快照 / 注释与交叉引用列表）不算改动：`applied` 里有说明文字，
+        // 不能拿它当「写过文档」的判据 —— 否则每读一次版本就 +1，分析完再应用必判版本冲突
+        let read_only = matches!(
+            req.action,
+            crate::types::AdvancedAction::StructureSnapshot
+                | crate::types::AdvancedAction::StructureDiff
+                | crate::types::AdvancedAction::ListNotes
+                | crate::types::AdvancedAction::ListCrossReferences
+        );
+        if !read_only && !r.applied.is_empty() {
             self.bump(&req.document_id);
         }
         Ok(r)
@@ -646,7 +655,9 @@ impl Session {
         let v = self.version(&req.document_id);
         let before = crate::anchors::hash_text(&d.content()?.text().unwrap_or_default());
         let r = crate::workflow::apply(&self.app, &d, req, v)?;
-        if r.applied > 0 {
+        // 只看 applied 会漏掉「写入成功但回读校验判失败」的那批：文档变了、版本号却不推进，
+        // 下一次调用拿着旧版本号照样写，锚点校验形同虚设。
+        if r.applied > 0 || r.side_effect_status != crate::error::SideEffectStatus::NotApplied {
             self.bump(&req.document_id);
             self.history.record(HistoryEntry {
                 operation_id: r.operation_id.clone(),

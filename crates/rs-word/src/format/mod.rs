@@ -2,6 +2,7 @@
 
 pub mod font;
 pub mod lists;
+pub mod numbering;
 pub mod paragraph;
 pub mod styles;
 
@@ -37,38 +38,71 @@ pub fn apply(
         .with_hint("提供 list_template.levels（1..=9 级）")
         .into());
     }
-    let ranges = resolve_ranges(app, doc, &req.target)?;
     let mut applied = Vec::new();
-    for resolved in &ranges {
-        apply_range(app, doc, req, &resolved.range, &mut applied)?;
+    let mut warnings = Vec::new();
+
+    // ① 样式定义（改样式本身）：排版模板的值从这条进来。
+    if let Some(profile) = &req.profile {
+        let (a, w) = styles::apply_profile_ext(doc, profile, req.dry_run)?;
+        applied.extend(a);
+        warnings.extend(w);
     }
-    if ranges.len() > 1 {
-        // 同一补丁写多段：回执里别把「bold」重复 N 次
-        let mut unique: Vec<String> = Vec::with_capacity(applied.len() + 1);
-        for item in applied {
-            if !unique.contains(&item) {
-                unique.push(item);
-            }
+    // ② 按段落序号批量套样式：分析结果落地的唯一入口，一次 COM 循环。
+    if let Some(list) = &req.assignments {
+        let (a, w) = styles::apply_assignments(doc, list, req.dry_run, req.reset_font)?;
+        applied.extend(a);
+        warnings.extend(w);
+    }
+
+    // ③ 对 Range 的字段补丁（原有路径）。
+    let range_patch = req.style.is_some()
+        || req.font.is_some()
+        || req.paragraph.is_some()
+        || req.list.is_some()
+        || req.list_template.is_some()
+        || req.reset.is_some();
+    if range_patch {
+        let ranges = resolve_ranges(app, doc, &req.target)?;
+        for resolved in &ranges {
+            apply_range(app, doc, req, &resolved.range, &mut applied)?;
         }
-        unique.push(format!("ranges x{}", ranges.len()));
-        applied = unique;
+        if ranges.len() > 1 {
+            // 同一补丁写多段：回执里别把「bold」重复 N 次
+            let mut unique: Vec<String> = Vec::with_capacity(applied.len() + 1);
+            for item in applied {
+                if !unique.contains(&item) {
+                    unique.push(item);
+                }
+            }
+            unique.push(format!("ranges x{}", ranges.len()));
+            applied = unique;
+        }
     }
-    // read-back：重读目标文本作为验证证据（多段取外包范围）
-    let anchor_range = if ranges.len() == 1 {
-        ranges[0].range.clone()
+
+    // read-back：重读目标文本作为验证证据（只有真正写过 Range 才需要）
+    let changed = !req.dry_run && !applied.is_empty();
+    let anchor = if range_patch && !req.dry_run {
+        let anchor_range = doc.content()?;
+        Some(anchors::anchor(
+            doc.id(),
+            Story::Main,
+            &anchor_range,
+            doc_version + u64::from(changed),
+            80,
+        )?)
     } else {
-        let start = ranges.iter().map(|r| r.start).min().unwrap_or(0);
-        let end = ranges.iter().map(|r| r.end).max().unwrap_or(start);
-        doc.range(start, end)?
+        None
     };
-    let anchor = anchors::anchor(doc.id(), Story::Main, &anchor_range, doc_version + 1, 80)?;
+    if req.dry_run {
+        applied.insert(0, "dry_run: 只生成计划，未修改文档".into());
+    }
     Ok(FormatResult {
         document_id: doc.id().to_string(),
         operation_id: crate::new_operation_id(),
-        doc_version: doc_version + 1,
-        target: Some(anchor),
+        doc_version: doc_version + u64::from(changed),
+        target: anchor,
         applied,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 

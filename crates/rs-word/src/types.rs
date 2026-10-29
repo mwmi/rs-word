@@ -5,6 +5,8 @@
 //! - 所有 Word 常量封装为 enum，AI/调用方永不传整数。
 //! - 格式补丁字段为 `Option<T>`：`None` = 不改；重置由显式 `reset` 表达。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub use crate::error::SideEffectStatus;
@@ -425,11 +427,13 @@ impl LineSpacing {
     }
 
     /// Multiple/Exactly/AtLeast 需要写 LineSpacing 数值；其余返回 None。
+    ///
+    /// **多倍行距在 COM 里是磅，不是倍数**：`LinesToPoints(1) = 12`，
+    /// 直接写 1.0 会变成 1/12 = 0.08 倍（字被压扁/裁掉的经典事故）。
     pub fn value_for_com(self) -> Option<f32> {
         match self {
-            Self::Multiple { value } | Self::Exactly { value } | Self::AtLeast { value } => {
-                Some(value)
-            }
+            Self::Multiple { value } => Some(value * 12.0),
+            Self::Exactly { value } | Self::AtLeast { value } => Some(value),
             _ => None,
         }
     }
@@ -767,6 +771,9 @@ pub struct ReadResult {
     /// 本次读取涉及的锚点。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<TextAnchor>,
+    /// 正文字数总量（summary/text 视图给）：一次读了多少、还剩多少，模型不必自己数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chars_total: Option<usize>,
 }
 
 // ───────────────────────── 编辑 ─────────────────────────
@@ -840,6 +847,22 @@ pub enum EditAction {
         target: Target,
         style: String,
     },
+    /// Markdown 一次写入：标题/列表/表格/引用/代码/公式都落成 Word 原生结构。
+    /// `style_map` 把语义类别映射到样式 id（由调用方的排版模板给出，缺省用内置样式）。
+    InsertMarkdown {
+        target: Target,
+        markdown: String,
+        #[serde(default)]
+        position: InsertPosition,
+        /// 语义类别 → 样式 id（模板给）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style_map: Option<BTreeMap<String, String>>,
+        /// `$$…$$` 是否构造成 Word 原生公式；false 时落「去掉 $ 的 LaTeX 原文」。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        math: Option<bool>,
+    },
+    /// 全文转换：把范围内残留的 `$$…$$`（独立）/ `$…$`（行内）一次性转成 Word 原生公式。
+    ConvertMath { target: Target },
 }
 
 /// 字段类型。
@@ -894,6 +917,9 @@ pub struct ActionResult {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<TextAnchor>,
+    /// 非致命提示（某段样式没套上、公式退回线性文本等）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub reversible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
@@ -1037,6 +1063,27 @@ pub struct FormatRequest {
     pub list_template: Option<ListTemplateSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset: Option<ResetSpec>,
+    /// 样式定义批量修改（改的是样式本身，不是某段文字）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::format::styles::StyleProfile>,
+    /// 按段落序号套样式（一次 COM 循环，带文本 hash 防错位）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignments: Option<Vec<StyleAssignment>>,
+    /// 只返回计划，不修改文档。
+    #[serde(default)]
+    pub dry_run: bool,
+    /// 套样式的同时清掉直接字符格式（模板要求「覆盖原有局部格式」时用）。
+    #[serde(default)]
+    pub reset_font: bool,
+}
+
+/// 把第 `paragraph_index` 段套成 `style`；`expected_text_hash` 不匹配则跳过。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StyleAssignment {
+    pub paragraph_index: u32,
+    pub style: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_text_hash: Option<String>,
 }
 
 /// 格式结果。
@@ -1136,6 +1183,16 @@ pub enum LayoutAction {
     InsertPageNumber,
     ExportPdf,
     UpdateFields,
+    /// 目录：不存在则插入（含标题段），已存在则就地更新。
+    InsertToc,
+    /// 只更新已有目录。
+    UpdateToc,
+    /// 页眉页脚三区（左/中/右，含 `{页码}` / `{总页数}` 字段）。
+    SetHeaderFooterZones,
+    /// 文字水印（页眉形状，尽力而为；引擎不支持时返回警告）。
+    SetWatermark,
+    /// 标题编号：把 Heading 1..N 绑定到 Word 原生多级列表。
+    HeadingNumbering,
 }
 
 /// 纸张大小。
@@ -1184,11 +1241,35 @@ impl Orientation {
     }
 }
 
+/// 版式垂直对齐（wdAlignVertical*）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalAlignment {
+    Top,
+    Center,
+    Justify,
+    Bottom,
+}
+
+impl VerticalAlignment {
+    pub fn code(self) -> i32 {
+        match self {
+            Self::Top => 0,
+            Self::Center => 1,
+            Self::Justify => 2,
+            Self::Bottom => 3,
+        }
+    }
+}
+
 /// 页面设置（mm 进入，内部转 pt）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PageSetupPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<PaperSize>,
+    /// 版式：垂直对齐（`center` 时内容超过一页会被上下裁切）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_align: Option<VerticalAlignment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation: Option<Orientation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1201,6 +1282,24 @@ pub struct PageSetupPatch {
     pub margin_right_mm: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gutter_mm: Option<f32>,
+    /// 页眉距边界（mm）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_distance_mm: Option<f32>,
+    /// 页脚距边界（mm）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_distance_mm: Option<f32>,
+    /// 首页页眉页脚不同。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub different_first_page: Option<bool>,
+    /// 奇偶页页眉页脚不同。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub different_odd_even: Option<bool>,
+    /// 分栏数（1 = 不分栏）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<u16>,
+    /// 栏间距（mm）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_spacing_mm: Option<f32>,
 }
 
 /// 页眉页脚设置。
@@ -1218,6 +1317,104 @@ pub struct HeaderFooterSpec {
     pub link_to_previous: bool,
 }
 
+/// 页眉页脚三区（左/中/右）。`{页码}` / `{总页数}` 会在写入时换成 Word 字段。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeaderFooterZones {
+    #[serde(default)]
+    pub header: bool,
+    #[serde(default)]
+    pub footer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_left: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_center: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_right: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_left: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_center: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_right: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_pt: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub different_first_page: bool,
+    #[serde(default)]
+    pub different_odd_even: bool,
+    /// 页码格式（decimal / upper_roman / lower_roman / upper_letter / lower_letter）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_page_number: Option<u32>,
+}
+
+/// 目录设置。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TocSpec {
+    /// 显示级别（1..=9）。
+    #[serde(default)]
+    pub max_level: u8,
+    /// 目录标题（空 = 不插标题段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// 目录标题用的样式（缺省 Heading 1 之外的「目录标题」样式，退 Normal）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_style: Option<String>,
+}
+
+/// 文字水印。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WatermarkSpec {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_pt: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_deg: Option<f32>,
+    /// 70 = 70% 透明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency_percent: Option<f32>,
+}
+
+/// 单级标题编号。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeadingLevelSpec {
+    /// 1..=9
+    pub level: u8,
+    /// 编号格式，如 `%1.` / `%1.%2` / `第%1章`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// 起始编号。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<u32>,
+}
+
+/// 标题编号（绑定 Word 原生多级列表）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeadingNumberingSpec {
+    #[serde(default)]
+    pub levels: Vec<HeadingLevelSpec>,
+}
+
+/// 页码设置。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PageNumberSpec {
+    /// decimal | upper_roman | lower_roman | upper_letter | lower_letter | chinese
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// 起始页码（续前节时为 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_at: Option<u32>,
+}
+
 /// 布局请求。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayoutRequest {
@@ -1227,6 +1424,16 @@ pub struct LayoutRequest {
     pub page: Option<PageSetupPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_footer: Option<HeaderFooterSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toc: Option<TocSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<WatermarkSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numbering: Option<HeadingNumberingSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number: Option<PageNumberSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_footer_zones: Option<HeaderFooterZones>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf_path: Option<String>,
     #[serde(default)]
@@ -1241,6 +1448,9 @@ pub struct LayoutResult {
     pub doc_version: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub applied: Vec<String>,
+    /// 非致命问题（某个引擎不支持水印 / 编号等）：调用方要展示，但不能当成整体失败。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exported: Option<ExportResult>,
 }
@@ -1261,6 +1471,9 @@ pub struct RevisionInfo {
     pub quote: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<i32>,
+    /// `Revision.Range.End`：界面要拿它判断「删除 + 插入」是否紧挨着（= 一处替换）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<i32>,
     pub text_hash: String,
     pub doc_version: u64,
 }
@@ -1276,12 +1489,36 @@ pub struct CommentInfo {
     pub quote: Option<String>,
 }
 
+/// 修订显示方式（`Window.View` 上那几个开关）。
+///
+/// 只在 f-manager 右栏的修订弹层里用（AI 不可见）：**读取时所有字段都填**，
+/// 写入时只认带上的字段（`None` = 这条不动）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ViewSettings {
+    /// inline（嵌入正文） | balloon（右侧批注框），对应 `MarkupMode`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup_mode: Option<String>,
+    /// 显示标记总开关（`ShowRevisionsAndComments`）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_markup: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_comments: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_insertions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_format: Option<bool>,
+}
+
 /// 审阅动作。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewAction {
     Status,
     SetTracking,
+    /// 读当前显示方式（不写）。
+    ViewStatus,
+    /// 改显示方式（只改 `view` 里带上的字段），回读一份。
+    SetView,
     ListRevisions,
     AcceptRevision,
     RejectRevision,
@@ -1317,6 +1554,9 @@ pub struct ReviewRequest {
     /// 修订筛选（accept_filtered/reject_filtered 用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<RevisionFilter>,
+    /// 显示方式（`set_view` 用；只带要改的字段）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewSettings>,
     #[serde(default = "default_limit_matches")]
     pub limit: u32,
 }
@@ -1328,6 +1568,9 @@ pub struct ReviewResult {
     pub operation_id: String,
     pub doc_version: u64,
     pub tracking: bool,
+    /// 显示方式（`status` / `view_status` / `set_view` 带上；窗口读不到时缺省）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewSettings>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub revisions: Vec<RevisionInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1790,7 +2033,7 @@ pub struct RevisionFilter {
     /// 作者白名单（大小写敏感）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authors: Option<Vec<String>>,
-    /// 类型白名单（`insert/delete/format/...`，见 `review::revision_type_name`）。
+    /// 类型白名单（`insert/delete/property/style/...`，见 `review::revision_type_name`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds: Option<Vec<String>>,
     /// 最多处理条数。
@@ -1968,6 +2211,12 @@ pub struct StructureSnapshot {
     pub tables: Vec<TableShapeSnapshot>,
     pub note_count: u32,
     pub media_count: u32,
+    /// 已有目录数量（0 = 还没有目录）。
+    #[serde(default)]
+    pub toc_count: i32,
+    /// 页数（`ComputeStatistics(wdStatisticPages)`；引擎不支持时为 0）。
+    #[serde(default)]
+    pub page_count: i32,
 }
 
 /// 结构差异项。

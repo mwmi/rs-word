@@ -51,6 +51,14 @@ impl Range {
         self.raw.call("Delete", vec![]).map(|_| ())
     }
 
+    /// 复制一份并缩到 `[start, end)`（Word 字符位置，非字节）。
+    /// 只动副本，不移动调用方的 Range。
+    pub fn narrowed(&self, start: i32, end: i32) -> Result<Range> {
+        let dup = self.raw.get("Duplicate")?.idispatch_child("Duplicate")?;
+        dup.call("SetRange", vec![ComValue::Int(start), ComValue::Int(end)])?;
+        Ok(Range::new(dup))
+    }
+
     pub fn insert_before(&self, text: &str) -> Result<()> {
         self.raw
             .call("InsertBefore", vec![ComValue::Str(text.to_string())])

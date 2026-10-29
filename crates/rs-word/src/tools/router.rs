@@ -158,6 +158,11 @@ fn session(client: &WordClient, input: &Value) -> Result<Value, ToolError> {
                 action: LayoutAction::ExportPdf,
                 page: None,
                 header_footer: None,
+                toc: None,
+                watermark: None,
+                numbering: None,
+                page_number: None,
+                header_footer_zones: None,
                 pdf_path: Some(path),
                 overwrite,
             })?)
